@@ -108,9 +108,9 @@ func (m Migrator) HasIndex(value interface{}, name string) bool {
 				name = idx.Name
 			}
 		}
-		currentSchema, curTable := m.CurrentSchema(stmt, stmt.Table)
+		_, curTable := m.CurrentSchema(stmt, stmt.Table)
 		return m.queryRaw(
-			"SELECT count(*) FROM pg_indexes WHERE tablename = ? AND indexname = ? AND schemaname = ?", curTable, name, currentSchema,
+			"SELECT count(*) FROM pg_catalog.pg_indexes WHERE tablename = ? AND indexname = ? AND schemaname = ?", curTable, name, "public",
 		).Scan(&count).Error
 	})
 
@@ -214,8 +214,8 @@ func (m Migrator) CreateTable(values ...interface{}) (err error) {
 func (m Migrator) HasTable(value interface{}) bool {
 	var count int64
 	m.RunWithValue(value, func(stmt *gorm.Statement) error {
-		currentSchema, curTable := m.CurrentSchema(stmt, stmt.Table)
-		return m.queryRaw("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?", currentSchema, curTable, "BASE TABLE").Scan(&count).Error
+		_, curTable := m.CurrentSchema(stmt, stmt.Table)
+		return m.queryRaw("SELECT count(*) FROM information_schema.tables WHERE table_schema = ? AND table_name = ? AND table_type = ?", "public", curTable, "BASE TABLE").Scan(&count).Error
 	})
 	return count > 0
 }
@@ -225,7 +225,11 @@ func (m Migrator) DropTable(values ...interface{}) error {
 	tx := m.DB.Session(&gorm.Session{})
 	for i := len(values) - 1; i >= 0; i-- {
 		if err := m.RunWithValue(values[i], func(stmt *gorm.Statement) error {
-			return tx.Exec("DROP TABLE IF EXISTS ? CASCADE", m.CurrentTable(stmt)).Error
+		//	tx.Exec("set spanner.support_drop_cascade=true")
+			if tx.Exec("SELECT * FROM ? LIMIT 1", m.CurrentTable(stmt)).Error == nil {
+				return tx.Exec("DROP TABLE ? CASCADE", m.CurrentTable(stmt)).Error
+			}
+			return nil
 		}); err != nil {
 			return err
 		}
@@ -266,10 +270,10 @@ func (m Migrator) HasColumn(value interface{}, field string) bool {
 			}
 		}
 
-		currentSchema, curTable := m.CurrentSchema(stmt, stmt.Table)
+		_, curTable := m.CurrentSchema(stmt, stmt.Table)
 		return m.queryRaw(
 			"SELECT count(*) FROM INFORMATION_SCHEMA.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?",
-			currentSchema, curTable, name,
+			"public", curTable, name,
 		).Scan(&count).Error
 	})
 
@@ -286,8 +290,8 @@ func (m Migrator) MigrateColumn(value interface{}, field *schema.Field, columnTy
 
 	return m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		var description string
-		currentSchema, curTable := m.CurrentSchema(stmt, stmt.Table)
-		values := []interface{}{currentSchema, curTable, field.DBName, stmt.Table, currentSchema}
+		_, curTable := m.CurrentSchema(stmt, stmt.Table)
+		values := []interface{}{"public", curTable, field.DBName, stmt.Table, "public"}
 		checkSQL := "SELECT description FROM pg_catalog.pg_description "
 		checkSQL += "WHERE objsubid = (SELECT ordinal_position FROM information_schema.columns WHERE table_schema = ? AND table_name = ? AND column_name = ?) "
 		checkSQL += "AND objoid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = ? AND relnamespace = "
@@ -444,11 +448,11 @@ func (m Migrator) HasConstraint(value interface{}, name string) bool {
 		if constraint != nil {
 			name = constraint.GetName()
 		}
-		currentSchema, curTable := m.CurrentSchema(stmt, table)
+		_, curTable := m.CurrentSchema(stmt, table)
 
 		return m.queryRaw(
 			"SELECT count(*) FROM INFORMATION_SCHEMA.table_constraints WHERE table_schema = ? AND table_name = ? AND constraint_name = ?",
-			currentSchema, curTable, name,
+			"public", curTable, name,
 		).Scan(&count).Error
 	})
 
@@ -460,10 +464,10 @@ func (m Migrator) ColumnTypes(value interface{}) (columnTypes []gorm.ColumnType,
 	err = m.RunWithValue(value, func(stmt *gorm.Statement) error {
 		var (
 			currentDatabase      = m.DB.Migrator().CurrentDatabase()
-			currentSchema, table = m.CurrentSchema(stmt, stmt.Table)
+			_, table = m.CurrentSchema(stmt, stmt.Table)
 			columns, err         = m.queryRaw(
 				"SELECT c.column_name, c.is_nullable = 'YES', c.udt_name, c.character_maximum_length, c.numeric_precision, c.numeric_precision_radix, c.numeric_scale, c.datetime_precision, 8 * typlen, c.column_default, pd.description, c.identity_increment FROM information_schema.columns AS c JOIN pg_type AS pgt ON c.udt_name = pgt.typname LEFT JOIN pg_catalog.pg_description as pd ON pd.objsubid = c.ordinal_position AND pd.objoid = (SELECT oid FROM pg_catalog.pg_class WHERE relname = c.table_name AND relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = c.table_schema)) where table_catalog = ? AND table_schema = ? AND table_name = ?",
-				currentDatabase, currentSchema, table).Rows()
+				currentDatabase, "public", table).Rows()
 		)
 
 		if err != nil {
@@ -514,7 +518,7 @@ func (m Migrator) ColumnTypes(value interface{}) (columnTypes []gorm.ColumnType,
 
 		// assign sql column type
 		{
-			rows, rowsErr := m.GetRows(currentSchema, table)
+			rows, rowsErr := m.GetRows("public", table)
 			if rowsErr != nil {
 				return rowsErr
 			}
@@ -535,7 +539,7 @@ func (m Migrator) ColumnTypes(value interface{}) (columnTypes []gorm.ColumnType,
 
 		// check primary, unique field
 		{
-			columnTypeRows, err := m.queryRaw("SELECT constraint_name FROM information_schema.table_constraints tc JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_catalog, table_name, constraint_name) JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema AND tc.table_name = c.table_name AND ccu.column_name = c.column_name WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE') AND c.table_catalog = ? AND c.table_schema = ? AND c.table_name = ? AND constraint_type = ?", currentDatabase, currentSchema, table, "UNIQUE").Rows()
+			columnTypeRows, err := m.queryRaw("SELECT constraint_name FROM information_schema.table_constraints tc JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_catalog, table_name, constraint_name) JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema AND tc.table_name = c.table_name AND ccu.column_name = c.column_name WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE') AND c.table_catalog = ? AND c.table_schema = ? AND c.table_name = ? AND constraint_type = ?", currentDatabase, "public", table, "UNIQUE").Rows()
 			if err != nil {
 				return err
 			}
@@ -547,7 +551,7 @@ func (m Migrator) ColumnTypes(value interface{}) (columnTypes []gorm.ColumnType,
 			}
 			columnTypeRows.Close()
 
-			columnTypeRows, err = m.queryRaw("SELECT c.column_name, constraint_name, constraint_type FROM information_schema.table_constraints tc JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_catalog, table_name, constraint_name) JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema AND tc.table_name = c.table_name AND ccu.column_name = c.column_name WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE') AND c.table_catalog = ? AND c.table_schema = ? AND c.table_name = ?", currentDatabase, currentSchema, table).Rows()
+			columnTypeRows, err = m.queryRaw("SELECT c.column_name, constraint_name, constraint_type FROM information_schema.table_constraints tc JOIN information_schema.constraint_column_usage AS ccu USING (constraint_schema, constraint_catalog, table_name, constraint_name) JOIN information_schema.columns AS c ON c.table_schema = tc.constraint_schema AND tc.table_name = c.table_name AND ccu.column_name = c.column_name WHERE constraint_type IN ('PRIMARY KEY', 'UNIQUE') AND c.table_catalog = ? AND c.table_schema = ? AND c.table_name = ?", currentDatabase, "public", table).Rows()
 			if err != nil {
 				return err
 			}
@@ -578,7 +582,7 @@ func (m Migrator) ColumnTypes(value interface{}) (columnTypes []gorm.ColumnType,
 		FROM pg_attribute a JOIN pg_class b ON a.attrelid = b.oid AND relnamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = ?)
 		WHERE a.attnum > 0 -- hide internal columns
 		AND NOT a.attisdropped -- hide deleted columns
-		AND b.relname = ?`, currentSchema, table).Rows()
+		AND b.relname = ?`, "public", table).Rows()
 			if err != nil {
 				return err
 			}
